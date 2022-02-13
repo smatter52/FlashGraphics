@@ -1,0 +1,1159 @@
+/* ********************************************************
+  Flash graphics emulation on OpenVG
+   ******************************************************** */
+
+/* Also FindFirst Findnext functions */
+#include <unistd.h>
+#include <stdbool.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include <X11/Xutil.h>
+#include <X11/XKBlib.h>
+#include <X11/Xcursor/Xcursor.h>
+#include <VG/openvg.h>
+#include "shGLESinit.h"
+#include "shContext.h"
+#include "shVectors.h"
+#include "shPaint.h"
+#include "findfirst.h"
+#include "shapes.h"
+#include "fg.h"
+#include "icon.h"
+#ifdef LedPin
+ #include <wiringPi.h>
+#endif
+
+#define DOTDOT_HANDLE    0L
+#define INVALID_HANDLE  -1L
+
+
+extern  Display  *x_display;
+extern  Window win ;
+extern EGLDisplay  egl_display;
+extern EGLContext  egl_context;
+extern EGLSurface  egl_surface;
+extern VGContext   *vg_context;
+
+struct fg_state fg ;   // fg variables declared here
+int exit_flag = 0 ;
+
+
+int _match_spec(const char* spec, const char* text) {
+    /*
+     * If the whole specification string was consumed and
+     * the input text is also exhausted: it's a match.
+     */
+    if (spec[0] == '\0' && text[0] == '\0') {
+        return 1;
+    }
+
+    /* A star matches 0 or more characters. */
+    if (spec[0] == '*') {
+        /*
+         * Skip the star and try to find a match after it
+         * by successively incrementing the text pointer.
+         */
+        do {
+            if (_match_spec(spec + 1, text)) {
+                return 1;
+            }
+        } while (*text++ != '\0');
+    }
+
+    /*
+     * An interrogation mark matches any character. Other
+     * characters match themself. Also, if the input text
+     * is exhausted but the specification isn't, there is
+     * no match.
+     */
+    if (text[0] != '\0' && (spec[0] == '?' || spec[0] == text[0])) {
+        return _match_spec(spec + 1, text + 1);
+    }
+
+    return 0;
+}
+
+int match_spec(const char* spec, const char* text) {
+    /* On Windows, *.* matches everything. */
+    if (strcmp(spec, "*.*") == 0) {
+        return 1;
+    }
+
+    return _match_spec(spec, text);
+}
+
+typedef struct fhandle_t {
+    DIR* dstream;
+    short dironly;
+    char* spec;
+} fhandle_t;
+
+static void fill_finddata(struct stat* st, const char* name,
+        struct _finddata_t* fileinfo);
+
+static intptr_t findfirst_dotdot(const char* filespec,
+        struct _finddata_t* fileinfo);
+
+static intptr_t findfirst_in_directory(const char* dirpath,
+        const char* spec, struct _finddata_t* fileinfo);
+
+static void findfirst_set_errno();
+
+intptr_t _findfirst(const char* filespec, struct _finddata_t* fileinfo) {
+    char* rmslash;      /* Rightmost forward slash in filespec. */
+    const char* spec;   /* Specification string. */
+
+    if (!fileinfo || !filespec) {
+        errno = EINVAL;
+        return INVALID_HANDLE;
+    }
+
+    if (filespec[0] == '\0') {
+        errno = ENOENT;
+        return INVALID_HANDLE;
+    }
+
+    rmslash = strrchr(filespec, '/');
+
+    if (rmslash != NULL) {
+        /*
+         * At least one forward slash was found in the filespec
+         * string, and rmslash points to the rightmost one. The
+         * specification part, if any, begins right after it.
+         */
+        spec = rmslash + 1;
+    } else {
+        /*
+         * Since no slash was found in the filespec string, its
+         * entire content can be used as our spec string.
+         */
+        spec = filespec;
+    }
+
+    if (strcmp(spec, ".") == 0 || strcmp(spec, "..") == 0) {
+        /* On Windows, . and .. must return canonicalized names. */
+        return findfirst_dotdot(filespec, fileinfo);
+    } else if (rmslash == filespec) {
+        /*
+         * Since the rightmost slash is the first character, we're
+         * looking for something located at the file system's root.
+         */
+        return findfirst_in_directory("/", spec, fileinfo);
+    } else if (rmslash != NULL) {
+        /*
+         * Since the rightmost slash isn't the first one, we're
+         * looking for something located in a specific folder. In
+         * order to open this folder, we split the folder path from
+         * the specification part by overwriting the rightmost
+         * forward slash.
+         */
+        size_t pathlen = strlen(filespec) +1;
+        char* dirpath = alloca(pathlen);
+        memcpy(dirpath, filespec, pathlen);
+        dirpath[rmslash - filespec] = '\0';
+        return findfirst_in_directory(dirpath, spec, fileinfo);
+    } else {
+        /*
+         * Since the filespec doesn't contain any forward slash,
+         * we're looking for something located in the current
+         * directory.
+         */
+        return findfirst_in_directory(".", spec, fileinfo);
+    }
+}
+
+/* Perfom a scan in the directory identified by dirpath. */
+static intptr_t findfirst_in_directory(const char* dirpath,
+        const char* spec, struct _finddata_t* fileinfo) {
+    DIR* dstream;
+    fhandle_t* ffhandle;
+
+    if (spec[0] == '\0') {
+        errno = ENOENT;
+        return INVALID_HANDLE;
+    }
+
+    if ((dstream = opendir(dirpath)) == NULL) {
+        findfirst_set_errno();
+        return INVALID_HANDLE;
+    }
+
+    if ((ffhandle = malloc(sizeof(fhandle_t))) == NULL) {
+        closedir(dstream);
+        errno = ENOMEM;
+        return INVALID_HANDLE;
+    }
+
+    /* On Windows, *. returns only directories. */
+    ffhandle->dironly = strcmp(spec, "*.") == 0 ? 1 : 0;
+    ffhandle->dstream = dstream;
+    ffhandle->spec = strdup(spec);
+
+    if (_findnext((intptr_t) ffhandle, fileinfo) != 0) {
+        _findclose((intptr_t) ffhandle);
+        errno = ENOENT;
+        return INVALID_HANDLE;
+    }
+
+    return (intptr_t) ffhandle;
+}
+
+/* On Windows, . and .. return canonicalized directory names. */
+static intptr_t findfirst_dotdot(const char* filespec,
+        struct _finddata_t* fileinfo) {
+    char* dirname;
+    char* canonicalized;
+    struct stat st;
+
+    if (stat(filespec, &st) != 0) {
+        findfirst_set_errno();
+        return INVALID_HANDLE;
+    }
+
+    /* Resolve filespec to an absolute path. */
+    if ((canonicalized = realpath(filespec, NULL)) == NULL) {
+        findfirst_set_errno();
+        return INVALID_HANDLE;
+    }
+
+    /* Retrieve the basename from it. */
+    dirname = basename(canonicalized);
+    dirname = canonicalized ;
+      
+    /* Make sure that we actually have a basename. */
+    if (dirname[0] == '\0') {
+        free(canonicalized);
+        errno = ENOENT;
+        return INVALID_HANDLE;
+    }
+
+    /* Make sure that we won't overflow finddata_t::name. */
+    if (strlen(dirname) > 259) {
+        free(canonicalized);
+        errno = ENOMEM;
+        return INVALID_HANDLE;
+    }
+
+    fill_finddata(&st, dirname, fileinfo);
+
+    free(canonicalized);
+
+    /*
+     * Return a special handle since we can't return
+     * NULL. The findnext and findclose functions know
+     * about this custom handle.
+     */
+    return DOTDOT_HANDLE;
+}
+
+/*
+ * Windows implementation of _findfirst either returns EINVAL,
+ * ENOENT or ENOMEM. This function makes sure that the above
+ * implementation doesn't return anything else when an error
+ * condition is encountered.
+ */
+static void findfirst_set_errno() {
+    if (errno != ENOENT &&
+        errno != ENOMEM &&
+        errno != EINVAL) {
+        errno = EINVAL;
+    }
+}
+
+static void fill_finddata(struct stat* st, const char* name,
+        struct _finddata_t* fileinfo) {
+    fileinfo->attrib = S_ISDIR(st->st_mode) ? _A_SUBDIR : _A_NORMAL;
+    fileinfo->size = st->st_size;
+    fileinfo->time_create = st->st_ctime;
+    fileinfo->time_access = st->st_atime;
+    fileinfo->time_write = st->st_mtime;
+    strcpy(fileinfo->name, name);
+}
+
+int _findnext(intptr_t fhandle, struct _finddata_t* fileinfo) {
+    struct dirent *entry ;
+    struct fhandle_t* handle;
+    struct stat st;
+
+    if (fhandle == DOTDOT_HANDLE) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    if (fhandle == INVALID_HANDLE || !fileinfo) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    handle = (struct fhandle_t*) fhandle;
+
+    while ((entry = readdir(handle->dstream)) != NULL) {
+        if (!handle->dironly && !match_spec(handle->spec, entry->d_name)) {
+            continue;
+        }
+
+        if (fstatat(dirfd(handle->dstream), entry->d_name, &st, 0) == -1) {
+            return -1;
+        }
+
+        if (handle->dironly && !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+
+        fill_finddata(&st, entry->d_name, fileinfo);
+
+        return 0;
+    }
+
+    errno = ENOENT;
+    return -1;
+}
+
+int _findclose(intptr_t fhandle) {
+    struct fhandle_t* handle;
+
+    if (fhandle == DOTDOT_HANDLE) {
+        return 0;
+    }
+
+    if (fhandle == INVALID_HANDLE) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    handle = (struct fhandle_t*) fhandle;
+
+    closedir(handle->dstream);
+    free(handle->spec);
+    free(handle);
+
+    return 0;
+}
+
+// Emulation of dos filesize()
+long filesize(char *fnam)
+{ intptr_t f ;
+  struct _finddata_t fdat;
+  long retval ;
+
+  if ((f = _findfirst(fnam, &fdat)) == 0)
+    retval = (-1L) ;
+  else
+    retval = (long)fdat.size ;
+
+  _findclose(f) ;
+  return (retval) ;
+}
+
+/* Also bios emulation in X11 */
+// to be modified
+int _bios_keybrd(int flag)
+{ int keychar, lcnt = 1000 ;    // 30 secs
+  XEvent evnt ;
+  int retval = 0;
+
+  if (flag == 1)         // Determine count of keys in window buffer
+   { event_looper() ;
+     retval = fg.key_press.cnt ;
+   }
+
+  else if (flag == 0)     // wait until key received  (but not forever)
+	{
+     while (retval == 0 && lcnt-- > 0)
+       { event_looper() ;
+         if (fg.key_press.cnt > 0)
+          { fg.key_press.cnt-- ;
+            retval = fg.key_press.keysym ;
+          }
+         usleep(30000) ;
+       }
+   }
+
+  return(retval) ;
+}
+
+// Set up line param for line type (except FG_LINE_SOLID)
+struct fg_line_param *set_line_param(int type)
+{
+  static fg_line_param_t line_param ;
+
+  line_param.cnt = 0;
+  line_param.array[0] = 0.0f ;
+  line_param.array[1] = 0.0f ;
+//   return(&line_param) ;
+  switch(type) {
+  case FG_LINE_SOLID:
+  break ;
+  case FG_LINE_MEDIUM_DASHED:
+    line_param.array[0] = 8; line_param.array[1] = 4 ;
+    line_param.cnt = 2 ;
+  break ;
+  case FG_LINE_DENSE_DOTTED:
+    line_param.array[0] = 2; line_param.array[1] = 2 ;
+    line_param.cnt = 2 ;
+  break ;
+  case FG_LINE_SPARSE_DOTTED:
+    line_param.array[0] = 2; line_param.array[1] = 8 ;
+    line_param.cnt = 2 ;
+  break ;
+  case FG_LINE_LONG_DASH:
+    line_param.array[0] = 16; line_param.array[1] = 4 ;
+    line_param.cnt = 2 ;
+  break ;
+  }
+// Set OpenVG here
+   vgSetfv(VG_STROKE_DASH_PATTERN, line_param.cnt, line_param.array);
+   vgSeti(VG_STROKE_DASH_PHASE_RESET, VG_TRUE);
+   vgSetf(VG_STROKE_DASH_PHASE, 0.0f);
+
+  return(&line_param) ;
+}
+
+
+// Set stroke color from fg_color_t with mode alpha adjustment
+void vgSetStroke(fg_color_t color_num, int mode)
+{   VGfloat color[4] ;
+
+    color[0] = ((VGfloat)(fg.palval_tab[color_num].r)) / 255.0 ;
+    color[1] = ((VGfloat)(fg.palval_tab[color_num].g)) / 255.0 ;
+    color[2] = ((VGfloat)(fg.palval_tab[color_num].b)) / 255.0 ;
+    color[3] = ((VGfloat)(fg.palval_tab[color_num].a) * (VGfloat)mode)
+                 / 65025.0 ;
+    setstroke(color) ;
+}
+
+// Set stroke color from fg_color_t
+void vgSetFill(fg_color_t color_num, int mode)
+{   VGfloat color[4] ;
+
+    color[0] = ((VGfloat)(fg.palval_tab[color_num].r)) / 255.0 ;
+    color[1] = ((VGfloat)(fg.palval_tab[color_num].g)) / 255.0 ;
+    color[2] = ((VGfloat)(fg.palval_tab[color_num].b)) / 255.0 ;
+    color[3] = ((VGfloat)(fg.palval_tab[color_num].a) * (VGfloat)mode)
+                 / 65025.0 ;
+    setfill(color) ;
+}
+
+// make a 2 color 8888 texture from a pixel matrix
+static uint8_t *rgba_p = NULL ;
+
+uint8_t *make_tex(fg_color_t colf, fg_color_t colb, unsigned char *matrix,
+                  fg_const_pbox_t box)
+{
+   unsigned int pixel_num, x, y, xrem, bw, bh ;
+   unsigned char shiftr ;
+
+   fg_palval_t ghost = {0,0,0,0}, bacgnd ;
+
+   if (colf == colb)
+    bacgnd = ghost ;
+   else
+    bacgnd = fg.palval_tab[colb] ;
+
+// Free any previous allocation
+   if (rgba_p != NULL)
+    { free(rgba_p) ;
+      rgba_p = NULL ;
+    }
+
+   pixel_num = fg_box_area(box) ;
+
+   // Allocate a chunk of space
+   if ((rgba_p = (uint8_t *)malloc(pixel_num * sizeof(fg_palval_t))) == NULL)
+    { fprintf(stderr,"Unable to malloc memory for texture\n") ;
+      return(NULL);
+    }
+
+   bw = fg_box_width(box); bh = fg_box_height(box);
+
+   for (y = 0; y < bh; y++)
+    { if ((bw % 8) == 0)
+       xrem = 0 ;
+      else
+       xrem = y * (8 - (bw % 8)) ;
+      for (x = 0; x < bw; x++)
+       { shiftr = 0x80 >> (x & 0x7) ;
+         if ((*(matrix + ((y * bw + x + xrem) >> 3)) & shiftr) == shiftr)
+          {
+            *((fg_palval_t *)(rgba_p + (y * bw + x)*
+              sizeof(fg_palval_t))) = fg.palval_tab[colf] ;
+//            fprintf(stderr,"%d %d %d %d\n", y, x, xrem, ((y * bw + x + xrem) >> 3)) ;
+          }
+         else
+          *((fg_palval_t *)(rgba_p + (y * bw + x)*
+               sizeof(fg_palval_t))) = bacgnd ;
+       }
+    }
+
+   return(rgba_p) ;
+}
+
+/* FG stuff */
+
+int fg_init(int screen_x, int screen_y)
+{  int rstat ;
+
+   printf("Screen: %d %d\n", screen_x, screen_y) ;
+   rstat = shGLESinit(screen_x, screen_y) ;
+   if (rstat == 0)
+    { XWindowAttributes  gwa;
+      XGetWindowAttributes ( x_display , win , &gwa );
+      glViewport ( 0 , 0 , gwa.width , gwa.height );
+      glClearColor ( 0 , 0 , 0 , 1.);    // background color
+      glClear ( GL_COLOR_BUFFER_BIT );
+// Set transform 1:1 pixel mapping
+      VGfloat mt[] = {1.0, 0, 0, 0, 1.0, 0, -1.0, -1.0, 1.0} ;
+      mt[0] = 2.0 / (VGfloat)screen_x ;
+      mt[4] = 2.0 / (VGfloat)screen_y ;
+// Load
+      vgSeti(VG_MATRIX_MODE, VG_MATRIX_PATH_USER_TO_SURFACE);
+      vgLoadMatrix(mt) ;
+// Matrix multiplication done in vertex shader
+      GLfloat mgl[16];
+      shMatrixToGL(&vg_context->pathTransform, mgl);
+      GLint locm ;
+      locm = glGetUniformLocation(shaderProgram, "mview") ;
+      glUniformMatrix4fv(locm, 1, GL_FALSE , (GLfloat *)mgl);
+
+// Supporting 256 user defined colors. Lets define the first 16 ?
+      fg.nsimulcolor = 256 ;
+      fg.displaybox[0] = 0; fg.displaybox[1] = 0;
+      fg.displaybox[2] = screen_x - 1; fg.displaybox[3] = screen_y - 1;
+      fg.aspect_ratio  = (float)vg_context->surfaceWidth /
+                          (float)vg_context->surfaceHeight ;
+#ifdef LedPin
+      wiringPiSetupGpio() ;
+      pinMode(LedPin, OUTPUT) ;
+#endif
+    }
+   return(rstat) ;
+}
+
+// Close the window
+void fg_term()
+{
+  fg_msm_cursorfreeall() ;
+  shGLESdeinit() ;
+}
+
+void fg_setpalette(fg_color_t color_num, fg_color_t red, fg_color_t green,
+                   fg_color_t blue, fg_color_t alpha)
+{
+   fg.palval_tab[color_num].r = red ;
+   fg.palval_tab[color_num].g = green ;
+   fg.palval_tab[color_num].b = blue ;
+   fg.palval_tab[color_num].a = alpha ;
+}
+
+
+// if mask != 0 glBlend is enabled
+void fg_drawmatrix(fg_color_t col, int mode, int mask, int rotation,
+                   fg_coord_t x, fg_coord_t y, unsigned char *pd,
+                   fg_const_pbox_t bx, fg_const_pbox_t clip)
+{
+  uint8_t *tex_p, colf, colb ;
+
+   colf = colb = col ;    // transparent background
+
+  if ((tex_p = make_tex(colf, colb,  pd, bx)) == NULL)
+    return ;
+   int p ;
+   SHCubic quadv, quadt;
+
+   quadv.p1.x = x + fg_box_width(bx) ;  quadv.p1.y = y;
+   quadv.p2.x = x; quadv.p2.y =  y ;
+   quadv.p3.x = x + fg_box_width(bx) ; quadv.p3.y =  y + fg_box_height(bx);
+   quadv.p4.x = x; quadv.p4.y =  y + fg_box_height(bx) ;
+
+   if (rotation > 3) rotation - 0 ;
+   switch (rotation) {
+// vertical down
+   case 0:
+     quadt.p1.x = 1.0; quadt.p1.y = 1.0;
+     quadt.p2.x = 0.0; quadt.p2.y = 1.0;
+     quadt.p3.x = 1.0; quadt.p3.y = 0.0;
+     quadt.p4.x = 0.0; quadt.p4.y = 0.0;
+     break ;
+// Rotate 90
+   case 1:
+      quadt.p1.x = 1.0; quadt.p1.y = 0.0;
+      quadt.p2.x = 1.0; quadt.p2.y = 1.0;
+      quadt.p3.x = 0.0; quadt.p3.y = 0.0;
+      quadt.p4.x = 0.0; quadt.p4.y = 1.0;
+      break ;
+// Rotate 180
+   case 2:
+      quadt.p1.x = 0.0; quadt.p1.y = 0.0;
+      quadt.p2.x = 1.0; quadt.p2.y = 0.0;
+      quadt.p3.x = 0.0; quadt.p3.y = 1.0;
+      quadt.p4.x = 1.0; quadt.p4.y = 1.0;
+      break ;
+// Rotate 270
+   case 3:
+      quadt.p1.x = 0.0; quadt.p1.y = 1.0;
+      quadt.p2.x = 0.0; quadt.p2.y = 0.0;
+      quadt.p3.x = 1.0; quadt.p3.y = 1.0;
+      quadt.p4.x = 1.0; quadt.p4.y = 0.0;
+      break ;
+   }
+
+// Just in case
+   SHfloat mgl[16];
+   shMatrixToGL(&vg_context->pathTransform, mgl);
+   GLint locm ;
+   locm = glGetUniformLocation(shaderProgram, "mview") ;
+   glUniformMatrix4fv(locm, 1, GL_FALSE , (GLfloat *) mgl );
+
+// Not using OpenVG so do cliping with OpenGL
+   unsigned int bw, bh ;
+   bw = fg_box_width(clip); bh = fg_box_height(clip);
+   if (clip[FG_Y2] < fg.displaybox[FG_Y2] ||
+       clip[FG_X2] < fg.displaybox[FG_X2] ||
+       clip[FG_Y1] > fg.displaybox[FG_Y1] ||
+       clip[FG_X1] > fg.displaybox[FG_X1])
+     { glScissor((GLint)clip[FG_X1], (GLint)clip[FG_Y1], (GLint)bw, (GLint)bh);
+       glEnable(GL_SCISSOR_TEST);
+     }
+
+   unsigned int texture;
+   glGenTextures(1, &texture);
+   glActiveTexture(GL_TEXTURE0) ;
+   glBindTexture(GL_TEXTURE_2D, texture);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, -1000);
+
+   GLvoid* vertices  = (GLvoid*) &quadv;
+	GLvoid* textures  = (GLvoid*) &quadt;
+// updating attribute values
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fg_box_width(bx),
+              fg_box_height(bx), 0, GL_RGBA, GL_UNSIGNED_BYTE, tex_p);
+// enabling vertex arrays
+   glVertexAttribPointer(position_loc, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+	glEnableVertexAttribArray(position_loc);
+	glVertexAttribPointer(texc_loc, 2, GL_FLOAT, GL_FALSE, 0, textures);
+	glEnableVertexAttribArray(texc_loc);
+
+   glUniform4f(color4_loc, 1.0f, 1.0f, 1.0f, 1.0f);
+
+// Blending usually SRC over
+   if (mask == 0)
+     glDisable(GL_BLEND);
+   else
+    { glEnable(GL_BLEND);
+      glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+      glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    }
+
+// Tell the frag shader switch (linear)
+   glUniform1i(tflag_loc, 1) ;
+
+// Draw the quad
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+   glDisableVertexAttribArray(position_loc);
+	glDisableVertexAttribArray(texc_loc);
+   glDisable(GL_SCISSOR_TEST);
+   glDeleteTextures(1, &texture) ;
+// Reset the frag shader switch
+   glUniform1i(tflag_loc, 0) ;
+
+   GLint errno ;
+   errno = glGetError() ;
+   if (errno != 0)
+     fprintf(stderr,"Glerr: 0%x\n", errno) ;
+}
+
+// mask is ignored
+void fg_drawthickline(fg_color_t col, int mode, int mask, int linetype,
+                     fg_const_pline_t line, fg_const_pbox_t clip, int width)
+{
+   vgSetStroke(col, mode) ;
+   StrokeWidth((float)width) ;
+   unsigned int bw, bh ;
+   bw = fg_box_width(clip); bh = fg_box_height(clip);
+   ClipRect(clip[FG_X1], clip[FG_Y1], bw, bh) ;
+   set_line_param(linetype) ;
+   Line((float)line[FG_X1], (float)line[FG_Y1], (float)line[FG_X2],
+             (float)line[FG_Y2]) ;
+   if (width > 1)         // Reset to 1 if greater
+     StrokeWidth((float)1) ;
+}
+
+void fg_drawlineclip(fg_color_t col, int mode, int mask, int linetype,
+                     fg_const_pline_t line, fg_const_pbox_t clip)
+{  fg_drawthickline(col, mode, mask, linetype, line, clip, 1) ; }
+
+void fg_drawline(fg_color_t col, int mode, int mask, int linetype,
+                     fg_const_pline_t line)
+{  fg_drawlineclip(col, mode, mask, linetype, line, fg.displaybox) ; }
+
+
+#define MAX_CURSOR 4
+struct Xcursor {
+ Cursor cur ;
+ XcursorImage *ci ;
+ } Xcursor_tab[MAX_CURSOR] ;
+
+static int tabcnt = 0 ;
+
+// Use fcur to set up an x11 bitmap cursor
+void fg_msm_setcursor(fg_msm_cursor_t *fcur, fg_color_t colf, fg_color_t colb)
+{  uint8_t *tex_p ;
+   uint32_t bw, bh ;
+
+   if (tabcnt > MAX_CURSOR)
+    { fprintf(stderr,"Max cursor number exceeded\n") ;
+      return ;
+    }
+
+   bw = fg_box_width(fcur->box); bh = fg_box_height(fcur->box);
+   tex_p = make_tex(colf, colb, fcur->matrix, fcur->box) ;
+
+ // this mallocs image space
+   Xcursor_tab[tabcnt].ci = XcursorImageCreate(bw, bh) ;
+   if (Xcursor_tab[tabcnt].ci != NULL)
+   {
+// cursor pixels
+     memcpy(Xcursor_tab[tabcnt].ci->pixels, tex_p, bw*bh*sizeof(XcursorPixel)) ;
+// hot spots
+     Xcursor_tab[tabcnt].ci->xhot = fcur->hot_x ;
+     Xcursor_tab[tabcnt].ci->yhot = fcur->hot_y ;
+// set cursor
+     Xcursor_tab[tabcnt].cur = XcursorImageLoadCursor(x_display,
+                                                  Xcursor_tab[tabcnt].ci) ;
+     XDefineCursor (x_display, win, Xcursor_tab[tabcnt].cur);
+
+     tabcnt++ ;
+   }
+}
+
+void fg_msm_cursorfree(unsigned int index)
+{
+  if (index >= MAX_CURSOR || Xcursor_tab[index].ci == NULL) return ;
+  XcursorImageDestroy(Xcursor_tab[index].ci) ;
+  Xcursor_tab[index].ci = NULL ;
+}
+
+void fg_msm_cursorfreeall(void)
+{ int i ;
+  for (i = 0; i < MAX_CURSOR; i++)
+   fg_msm_cursorfree(i) ;
+}
+
+void fg_msm_showcursor(int index)
+{
+  if (index >= MAX_CURSOR || Xcursor_tab[index].ci == NULL) return ;
+  XDefineCursor (x_display, win, Xcursor_tab[index].cur);
+}
+
+void fg_msm_setcurpos(fg_coord_t x, fg_coord_t y)
+{
+    if (x > vg_context->surfaceWidth) x = vg_context->surfaceWidth ;
+    if (y > vg_context->surfaceHeight) x = vg_context->surfaceHeight ;
+    y = vg_context->surfaceHeight - y ;
+    XWarpPointer(x_display, None, win, 0, 0, 0, 0, x, y);
+    XFlush(x_display);
+}
+
+void fg_msm_setactivepage()
+{ }
+
+// This makes an implicit glFlush() and copies buffer to surface
+// flag 0: EGL_BACK_BUFFER
+// flag 1: EGL_SINGLE_BUFFER emulated (slowly)
+
+void fg_flush(int flag)
+{ static fg_handle_t fgh ;
+  if (flag == 0)
+   { eglSwapBuffers(egl_display, egl_surface) ;  // buffer to the screen
+     usleep(33000) ;   // magic delay for vsync
+   }
+  else
+   {
+     fgh = fg_save(fg.displaybox) ;
+     eglSwapBuffers(egl_display, egl_surface) ;
+     usleep(33000) ;   // magic delay for vsync
+     fg_restore(fgh) ;
+   }
+}
+
+void fg_msm_motion(uint8_t m)
+{ }
+
+// Normalise and limit msm coordinates
+int norm_mousex(int x)
+{ if (x >= vg_context->surfaceWidth)
+    x = vg_context->surfaceWidth - 1;
+  return (x);
+}
+
+int norm_mousey(int y)
+{ int yn ;
+
+  yn = vg_context->surfaceHeight - y - 1;
+  if (yn >= vg_context->surfaceHeight)
+   yn = vg_context->surfaceHeight - 1;
+  return (yn) ;
+}
+
+unsigned int fg_msm_getstatus(fg_coord_t *x_p, fg_coord_t *y_p)
+{
+  *x_p = (fg_coord_t)fg.motion_notify.px ;
+  *y_p = (fg_coord_t)fg.motion_notify.py ;
+
+  return (fg.motion_notify.bmap)  ;
+}
+
+unsigned int fg_msm_getpress(unsigned int *but_num, fg_coord_t *x_p,
+                             fg_coord_t *y_p)
+{ int but, bmap ;
+
+  but = *but_num ;
+  switch (but) {
+  case FG_MSM_LEFT :
+   *but_num = fg.button_press.cntl ;
+   fg.button_press.cntl = 0 ;
+   break ;
+  case FG_MSM_MIDDLE :
+   *but_num = fg.button_press.cntm ;
+   fg.button_press.cntm = 0 ;
+   break ;
+  case FG_MSM_RIGHT :
+   *but_num = fg.button_press.cntr ;
+   fg.button_press.cntr = 0 ;
+    break ;
+  }
+
+  *x_p = (fg_coord_t)fg.button_press.px ;
+  *y_p = (fg_coord_t)fg.button_press.py ;
+
+  bmap = fg.button_press.bmap ;
+  fg.button_press.bmap = 0 ;
+  return(bmap) ;
+}
+
+void fg_drawbox(fg_color_t col,int mode, int mask, int linetype,
+                fg_const_pbox_t box, fg_const_pbox_t clip)
+{  unsigned int bw, bh, cw, ch ;
+
+   bw = fg_box_width(box); bh = fg_box_height(box);
+   vgSetStroke(col, mode) ;
+   cw = fg_box_width(clip); ch = fg_box_height(clip);
+   ClipRect(clip[FG_X1], clip[FG_Y1], cw, ch);
+   set_line_param(linetype) ;
+   RectOutline((float)box[FG_X1],(float)box[FG_Y1],(float)bw,(float)bh);
+}
+
+void fg_drawroundbox(fg_color_t col,int mode, int mask, int linetype,
+                fg_const_pbox_t box, int rw, int rh)
+{  unsigned int bw, bh ;
+
+   bw = fg_box_width(box); bh = fg_box_height(box);
+   vgSetStroke(col, mode) ;
+   set_line_param(linetype) ;
+   Roundrect_f((float)box[FG_X1],(float)box[FG_Y1],(float)bw,(float)bh,
+                 rw, rh, 0);
+}
+
+// Start and end angles ignored
+void fg_drawellipse(fg_color_t col,int mode, int mask, fg_coord_t x ,fg_coord_t y,
+                    fg_coord_t xradius, fg_coord_t yradius, int startangle,
+                    int endangle, fg_const_pbox_t clip)
+{  unsigned int cw, ch ;
+   vgSetStroke(col, mode) ;
+   set_line_param(FG_LINE_SOLID) ;
+   cw = fg_box_width(clip); ch = fg_box_height(clip);
+   ClipRect(clip[FG_X1], clip[FG_Y1], cw, ch);
+   Ellipse_f((float)x, (float)y, (float)xradius*2, (float)yradius*2, 0);
+}
+
+void fg_fillellipse(fg_color_t col,int mode, int mask, fg_coord_t x ,fg_coord_t y,
+                    fg_coord_t xradius, fg_coord_t yradius, int startangle,
+                    int endangle, fg_const_pbox_t clip)
+{  unsigned int cw, ch ;
+
+   vgSetStroke(col, mode) ;
+   set_line_param(FG_LINE_SOLID) ;
+   cw = fg_box_width(clip); ch = fg_box_height(clip);
+   ClipRect(clip[FG_X1], clip[FG_Y1], cw, ch);
+   Ellipse_f((float)x, (float)y, (float)xradius*2, (float)yradius*2, 1);
+}
+
+
+void fg_fillbox(fg_color_t col,int mode, int mask, fg_const_pbox_t box)
+{  unsigned int bw, bh ;
+
+   bw = fg_box_width(box); bh = fg_box_height(box);
+   vgSetFill(col, mode) ;
+   set_line_param(FG_LINE_SOLID) ;
+// Reset any previous clipping
+   ClipRect(0, 0, vg_context->surfaceWidth, vg_context->surfaceHeight) ;
+   Rect_f((float)box[FG_X1],(float)box[FG_Y1],(float)bw,(float)bh, 1);
+}
+
+void fg_fillroundbox(fg_color_t col,int mode, int mask, fg_const_pbox_t box,
+                     int rw, int rh)
+{  unsigned int bw, bh ;
+
+   bw = fg_box_width(box); bh = fg_box_height(box);
+   vgSetFill(col, mode) ;
+   set_line_param(FG_LINE_SOLID) ;
+// Reset any previous clipping
+   ClipRect(0, 0, vg_context->surfaceWidth, vg_context->surfaceHeight) ;
+   Roundrect_f((float)box[FG_X1],(float)box[FG_Y1],(float)bw,(float)bh,
+                 rw, rh, 1);
+}
+
+fg_color_t fg_readdot(fg_coord_t x, fg_coord_t y)
+{  int indx ;
+   fg_palval_t pix ;
+
+   glReadPixels(x, y, 1, 1, GL_RGBA ,GL_UNSIGNED_BYTE, &pix) ;
+
+   for(indx = 0; indx < FG_COLOR_MAX; indx++)
+   {
+      if (memcmp(&pix, &fg.palval_tab[indx], sizeof(fg_palval_t)) == 0)
+         return(indx) ;
+   }
+   return(-1) ;
+}
+
+// return non black in area
+fg_color_t fg_readdots(fg_coord_t x, fg_coord_t y)
+{  int indx, pixi, cnt = 0 ;
+   fg_palval_t pix[4] ;
+   fg_color_t col[4] ;
+
+   glReadPixels(x, y, 2, 2, GL_RGBA ,GL_UNSIGNED_BYTE, &pix) ;
+
+   for(indx = 0; indx < FG_COLOR_MAX; indx++)
+   {
+     for (pixi = 0; pixi < 4; pixi++)
+      { if (memcmp(&pix[indx], &fg.palval_tab[indx], sizeof(fg_palval_t)) == 0)
+         { cnt++ ;
+           col[pixi] = indx ;
+         }
+      }
+   }
+   return(-1) ;
+}
+
+// Save storage ares
+static fg_save_t fg_save_tab[MAX_SAVE] ;
+
+// Save is increased by 2 pixels on both axes to ensure coverage
+fg_handle_t fg_save(fg_const_pbox_t cbox)
+{  int indx ;
+   unsigned int bw, bh, pixel_num ; ;
+   uint8_t *dat_p = NULL;
+   fg_box_t box ;
+   box[FG_X1] = cbox[FG_X1] ;
+   box[FG_X2] = cbox[FG_X2] ;
+   box[FG_Y1] = cbox[FG_Y1] ;
+   box[FG_Y2] = cbox[FG_Y2] ;
+
+   if (box[FG_X1] > 0) box[FG_X1]-- ;
+   if (box[FG_Y1] > 0) box[FG_Y1]-- ;
+   if (box[FG_X2] < (vg_context->surfaceWidth - 1)) box[FG_X2]++ ;
+   if (box[FG_Y2] < (vg_context->surfaceHeight - 1)) box[FG_Y2]++ ;
+
+   pixel_num = fg_box_area(box) ;
+   bw = fg_box_width(box); bh = fg_box_height(box);
+
+   for (indx = 0; indx < MAX_SAVE; indx++)
+    { if  (fg_save_tab[indx].data == NULL)
+       { printf("fnd_indx %d\n", indx) ;
+         if ((dat_p = malloc(pixel_num * sizeof(fg_palval_t))) == NULL)
+           { fprintf(stderr,"Unable to malloc memory for texture\n") ;
+             return((fg_handle_t)-1);
+           }
+          fg_save_tab[indx].x = box[FG_X1] ;
+          fg_save_tab[indx].y = box[FG_Y1] ;
+          fg_save_tab[indx].w = bw ;
+          fg_save_tab[indx].h = bh ;
+          glReadPixels(box[FG_X1], box[FG_Y1], bw, bh, GL_RGBA,
+                       GL_UNSIGNED_BYTE, dat_p) ;
+          fg_save_tab[indx].data = dat_p ;
+          return((fg_handle_t)indx + 1) ;
+       }
+    }
+   return((fg_handle_t)-1) ;
+}
+
+void fg_restore(fg_handle_t indxp)
+{
+   SHCubic quadv, quadt;
+   int indx ; char isign ;
+
+// Negative index inhibits deletion
+   if (indxp < 0) isign = 0 ; else isign = 1 ;
+   indx = abs(indxp) - 1 ;
+
+   quadv.p1.x = fg_save_tab[indx].x  + fg_save_tab[indx].w;
+   quadv.p1.y = fg_save_tab[indx].y;
+
+   quadv.p2.x = fg_save_tab[indx].x ;
+   quadv.p2.y = fg_save_tab[indx].y ;
+
+   quadv.p3.x = fg_save_tab[indx].x  + fg_save_tab[indx].w;;
+   quadv.p3.y = fg_save_tab[indx].y + fg_save_tab[indx].h;
+
+   quadv.p4.x = fg_save_tab[indx].x ;
+   quadv.p4.y =  fg_save_tab[indx].y + fg_save_tab[indx].h ;
+
+   quadt.p1.x = 1.0; quadt.p1.y = 0.0;
+   quadt.p2.x = 0.0; quadt.p2.y = 0.0;
+   quadt.p3.x = 1.0; quadt.p3.y = 1.0;
+   quadt.p4.x = 0.0; quadt.p4.y = 1.0;
+
+// Just in case
+   SHfloat mgl[16];
+   shMatrixToGL(&vg_context->pathTransform, mgl);
+   GLint locm ;
+   locm = glGetUniformLocation(shaderProgram, "mview") ;
+   glUniformMatrix4fv(locm, 1, GL_FALSE , (GLfloat *) mgl );
+
+   unsigned int texture;
+   glGenTextures(1, &texture);
+   glActiveTexture(GL_TEXTURE0) ;
+   glBindTexture(GL_TEXTURE_2D, texture);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_LOD, -1000);
+
+   GLvoid* vertices  = (GLvoid*) &quadv;
+	GLvoid* textures  = (GLvoid*) &quadt;
+// updating attribute values
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fg_save_tab[indx].w,
+              fg_save_tab[indx].h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+              fg_save_tab[indx].data);
+// enabling vertex arrays
+   glVertexAttribPointer(position_loc, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+	glEnableVertexAttribArray(position_loc);
+	glVertexAttribPointer(texc_loc, 2, GL_FLOAT, GL_FALSE, 0, textures);
+	glEnableVertexAttribArray(texc_loc);
+
+   glUniform4f(color4_loc, 1.0f, 1.0f, 1.0f, 1.0f);
+// Tell the frag shader switch (linear)
+   glUniform1i(tflag_loc, 1) ;
+
+// Draw the quad
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+   glDisableVertexAttribArray(position_loc);
+	glDisableVertexAttribArray(texc_loc);
+   glDeleteTextures(1, &texture) ;
+// Reset the frag shader switch
+   glUniform1i(tflag_loc, 0) ;
+//   printf("p: %p\n", fg_save_tab[indx].data) ;
+   if (isign)
+    { printf("del_indx %d\n", indx) ;
+      free(fg_save_tab[indx].data) ;
+      fg_save_tab[indx].data = NULL ;
+    }
+}
+
+void fg_remove(fg_handle_t indxp)
+{
+  printf("rm_indx %d\n", indxp-1) ;
+  if (indxp != 0 && fg_save_tab[indxp-1].data != NULL)
+   {
+     free(fg_save_tab[indxp-1].data) ;
+     fg_save_tab[indxp-1].data = NULL ;
+   }
+}
+
+void fg_removeall()
+{  int indxp ;
+   for (indxp = 1; indxp <= MAX_SAVE; indxp++)
+      fg_remove(indxp) ;
+}
+
+/* Event_looper must be called in idle time to read the event queue and
+   handle the events. The msm and bios functions can then pick up the
+   event data. It is also responsible for setting the global exit flag
+*/
+
+void event_looper()
+{  XEvent  xev;
+   Atom wmDeleteMessage = XInternAtom(x_display, "WM_DELETE_WINDOW", False);
+   XSetWMProtocols(x_display, win, &wmDeleteMessage, 1);
+   unsigned int keysym ;
+#ifdef LedPin
+  led_on() ;
+#endif
+   while ( XPending(x_display) )    // check for events from the x-server
+      { XNextEvent( x_display, &xev );
+        if (xev.type == ClientMessage)
+         { if (xev.xclient.data.l[0] == wmDeleteMessage)
+            { exit_flag |= 1 ;
+               shGLESdeinit() ;
+#ifdef LedPin
+               led_off() ;
+#endif
+               exit(1) ;
+             }
+         }
+        else if ( xev.type == KeyPress)
+         { keysym = XkbKeycodeToKeysym(x_display, xev.xkey.keycode, 0,
+                                  xev.xkey.state & ShiftMask ? 1 : 0) ;
+           if (keysym == XK_Escape) // Esc
+             { exit_flag |= 2 ;
+               shGLESdeinit() ;
+#ifdef LedPin
+               led_off() ;
+#endif
+               exit(2) ;
+             }
+           else
+            { fg.key_press.keycode = xev.xkey.keycode ;
+              fg.key_press.keysym = keysym ;
+              fg.key_press.cnt++ ;
+            }
+         }
+        else if ( xev.type == ButtonPress)
+          {
+            fg.button_press.px = norm_mousex(xev.xbutton.x) ;
+            fg.button_press.py = norm_mousey(xev.xbutton.y) ;
+            if (xev.xbutton.button == Button1)
+              { fg.button_press.cntl++ ;
+                fg.button_press.bmap = 0x1 ;
+              }
+            else if (xev.xbutton.button == Button2)
+              { fg.button_press.cntm++ ;
+                fg.button_press.bmap = 0x4 ;
+              }
+            else if (xev.xbutton.button == Button3)
+              { fg.button_press.cntr++ ;
+                fg.button_press.bmap = 0x2 ;
+              }
+          }
+        else if ( xev.type == MotionNotify)
+          { fg.motion_notify.px = norm_mousex(xev.xbutton.x) ;
+            fg.motion_notify.py = norm_mousey(xev.xbutton.y) ;
+            fg.motion_notify.bmap = 0 ;
+            if ((xev.xbutton.state & Button1Mask) == Button1Mask)
+              fg.motion_notify.bmap |= 0x1 ;
+            if ((xev.xbutton.state & Button2Mask) == Button2Mask)
+              fg.motion_notify.bmap |= 0x4 ;
+            if ((xev.xbutton.state & Button3Mask) == Button3Mask)
+              fg.motion_notify.bmap |= 0x2 ;
+            fg.motion_notify.cnt++ ;
+          }
+      }
+#ifdef LedPin
+   led_off() ;
+#endif
+}
+
+#ifdef LedPin
+void led_on()
+{  digitalWrite(LedPin, HIGH);   //led on
+   usleep(500) ;
+}
+
+void led_off()
+{  digitalWrite(LedPin, LOW);  //led off
+}
+#endif
+
