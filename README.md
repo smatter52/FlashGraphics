@@ -18,7 +18,7 @@ clicks and keyboard presses.
 ## Differences
 OpenGLes does not support XOR writing. The mode flag is re-purposed to set the alpha blend.
 
-EGL does support EGL_SINGLE_BUFFER so fg_flush(0) must be called to make the render visible.
+EGL does not support EGL_SINGLE_BUFFER so fg_flush(0) must be called to make the render visible.
 
 The function event_looper() must be called periodically to handle the event queue.
 Do not call it in a tight loop as this is detrimental to Linux.
