@@ -11,17 +11,19 @@
 #define _cdecl
 #define _near
 
+
 #if __cplusplus
 extern "C" {
 #endif
 
 // Debugging LED
-// #define LedPin 26       // GPIO pin
+#define LedPin 26       // GPIO pin
 #ifdef LedPin
 void led_on() ;
 void led_off() ;
 #endif
 
+ 
 /* Definition of basic coordinate system                */
 
 /************************************
@@ -66,7 +68,7 @@ typedef unsigned short _FAR *fg_ppattern_t;     /* Pointer to a pattern type*/
 #define FG_X2 2
 #define FG_Y2 3
 
-// No of cursors supported
+// No of cursors supported. Cursor(0) is blank ie. hide cursor
 #define MAX_CURSOR 4
 
 /* Midpoint of 2 coordinates    */
@@ -132,6 +134,7 @@ a fg_readbox. */
 #define FG_MSM_LEFT   1
 #define FG_MSM_RIGHT  2
 #define FG_MSM_MIDDLE 4
+#define FG_MSM_ALL	 8
 
 typedef struct fg_msm_cursor
 {
@@ -217,11 +220,11 @@ typedef struct fg_line_param
 void event_looper() ;
 
 // Function protoypes as declared in code
-void SetWindowName(char *name) ;
 int fg_init(int screen_x, int screen_y) ;
 void fg_term(void) ;
 void fg_msm_flush() ;
 void fg_msm_showcursor(int index) ;
+void fg_msm_hidecursor(void) ;
 void fg_msm_term(void) ;
 void fg_msm_setcursor(fg_msm_cursor_t *fcur, fg_color_t colf, fg_color_t colb);
 void fg_msm_cursorfree(unsigned int index) ;

@@ -663,13 +663,10 @@ void fg_drawmatrix(fg_color_t col, int mode, int mask, int rotation,
    glUniform1i(tflag_loc, 1) ;
 
 // Draw the quad
-   glEnableVertexAttribArray(position_loc);
-   glEnableVertexAttribArray(texc_loc);
    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
    glDisableVertexAttribArray(position_loc);
 	glDisableVertexAttribArray(texc_loc);
    glDisable(GL_SCISSOR_TEST);
-   glDisable(GL_BLEND);
    glDeleteTextures(1, &texture) ;
 // Reset the frag shader switch
    glUniform1i(tflag_loc, 0) ;

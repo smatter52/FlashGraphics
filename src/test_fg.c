@@ -150,7 +150,7 @@ int main(int argc, char **argv)
   int key ;
   while (exit_flag == 0)
    {
-     event_looper() ;
+//     event_looper() ;   Calls now in fg library
 
      int but_num = FG_MSM_LEFT ;
      if ((stat = fg_msm_getpress(&but_num,&px, &py)) != 0)
